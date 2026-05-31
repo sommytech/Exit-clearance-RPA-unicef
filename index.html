@@ -546,358 +546,918 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 </div>
 
 <script>
-// ══════════════════════════════════════════════════════════════
-// CONSTANTS & STATE
-// ══════════════════════════════════════════════════════════════
-const UNITS = [
-  { id:'admin',    name:'Administration', role:'Asset & Access Clearance',   icon:'🏢', color:'#6366F1', cls:'u-admin' },
-  { id:'security', name:'Security',       role:'Badge & Premises Clearance', icon:'🛡️', color:'#8B5CF6', cls:'u-security' },
-  { id:'ict',      name:'ICT',            role:'Systems & Device Return',    icon:'💻', color:'#0EA5E9', cls:'u-ict' },
-  { id:'finance',  name:'Finance',        role:'Financial Obligations',      icon:'💰', color:'#10B981', cls:'u-finance' },
-  { id:'hr',       name:'Human Resources',role:'Final Clearance & Sign-off', icon:'✅', color:'#F59E0B', cls:'u-hr' },
-];
 
-const SLA_MINUTES = 2;
-let requests = [];
-let activeReqId = null;
-let prevView = 'dashboard';
-let currentRole = 'hr';
-let slaTimers = {};
-let escPending = null;
-let pendingFiles = []; // staged uploads before submit
+  /**
+   * =============================================================
+   * UNICEF COUNTRY OFFICE — EXIT CLEARANCE SYSTEM
+   * Prototype simulation of the SharePoint + Power Automate
+   * automated staff exit clearance workflow.
+   *
+   * Architecture overview:
+   *   - All state is held in-memory (replaces SharePoint Lists)
+   *   - Sequential approval engine mirrors Power Automate flows
+   *   - Role switching simulates separate user logins per unit
+   *   - SLA timers simulate Power Automate scheduled triggers
+   *   - Document upload uses FileReader API (replaces SharePoint
+   *     document libraries)
+   * =============================================================
+   */
 
-const ROLE_MAP = {
-  hr:       { label:'HR Manager', icon:'👤', unitIdx:null },
-  admin:    { label:'Admin Officer', icon:'🏢', unitIdx:0 },
-  security: { label:'Security Officer', icon:'🛡️', unitIdx:1 },
-  ict:      { label:'ICT Officer', icon:'💻', unitIdx:2 },
-  finance:  { label:'Finance Officer', icon:'💰', unitIdx:3 },
-  hrunit:   { label:'HR Clearance Officer', icon:'✅', unitIdx:4 },
-  staff:    { label:'Staff Member', icon:'🧑‍💼', unitIdx:null },
-};
 
-const FILE_ICONS = { pdf:'📄', doc:'📝', docx:'📝', jpg:'🖼️', jpeg:'🖼️', png:'🖼️', msg:'📧', eml:'📧', default:'📎' };
-function fileIcon(name) { const ext=(name.split('.').pop()||'').toLowerCase(); return FILE_ICONS[ext]||FILE_ICONS.default; }
-function fileSize(bytes) { return bytes>1048576?(bytes/1048576).toFixed(1)+' MB':(bytes/1024).toFixed(0)+' KB'; }
-function genId() { return 'CLR-'+Date.now().toString(36).toUpperCase().slice(-6); }
-function genDocId() { return 'DOC-'+Date.now().toString(36).toUpperCase().slice(-5); }
-function nowFull() { return new Date().toLocaleString('en-GB',{dateStyle:'short',timeStyle:'medium'}); }
+  /* ─────────────────────────────────────────────────────────────
+   * CLEARANCE UNITS
+   * Defines the five mandatory approval units in sequential order.
+   * Each unit must approve before the request advances to the next.
+   * "cls" maps to the CSS colour stripe on each unit card.
+   * ───────────────────────────────────────────────────────────── */
+  const UNITS = [
+    { id: 'admin',    name: 'Administration', role: 'Asset & Access Clearance',   icon: '🏢', color: '#6366F1', cls: 'u-admin'    },
+    { id: 'security', name: 'Security',        role: 'Badge & Premises Clearance', icon: '🛡️', color: '#8B5CF6', cls: 'u-security' },
+    { id: 'ict',      name: 'ICT',             role: 'Systems & Device Return',    icon: '💻', color: '#0EA5E9', cls: 'u-ict'      },
+    { id: 'finance',  name: 'Finance',         role: 'Financial Obligations',      icon: '💰', color: '#10B981', cls: 'u-finance'  },
+    { id: 'hr',       name: 'Human Resources', role: 'Final Clearance & Sign-off', icon: '✅', color: '#F59E0B', cls: 'u-hr'       },
+  ];
 
-// ══════════════════════════════════════════════════════════════
-// FILE UPLOAD (staging before submit)
-// ══════════════════════════════════════════════════════════════
-function handleFileSelect(e) {
-  const files = Array.from(e.target.files);
-  files.forEach(f => {
-    const reader = new FileReader();
-    reader.onload = ev => {
-      pendingFiles.push({ id:genDocId(), name:f.name, type:f.type, size:f.size, dataURL:ev.target.result, ext:(f.name.split('.').pop()||'').toLowerCase() });
-      renderPendingFiles();
-    };
-    reader.readAsDataURL(f);
-  });
-  e.target.value = '';
-}
+  /* ─────────────────────────────────────────────────────────────
+   * SLA CONFIGURATION
+   * Set to 2 minutes for demo visibility.
+   * In production this would be 48 hours (Power Automate timeout).
+   * ───────────────────────────────────────────────────────────── */
+  const SLA_MINUTES = 2;
 
-function removePendingFile(id) { pendingFiles = pendingFiles.filter(f=>f.id!==id); renderPendingFiles(); }
+  /* ─────────────────────────────────────────────────────────────
+   * APPLICATION STATE
+   * These variables hold the live runtime state of the prototype.
+   * In the real system, SharePoint Lists would persist this data.
+   * ───────────────────────────────────────────────────────────── */
+  let requests    = [];        // All clearance request objects
+  let activeReqId = null;      // ID of the request currently open in the detail view
+  let prevView    = 'dashboard'; // Remembered for the back-button navigation
+  let currentRole = 'hr';      // Simulates the currently logged-in user role
+  let slaTimers   = {};        // Active setInterval handles keyed by request ID
+  let escPending  = null;      // Request object awaiting escalation acknowledgement
+  let pendingFiles = [];       // Files staged in the upload form before submission
 
-function renderPendingFiles() {
-  const el = document.getElementById('uploadedFilesList');
-  if (!pendingFiles.length) { el.innerHTML=''; return; }
-  el.innerHTML = pendingFiles.map(f => `
-    <div class="uploaded-file-item">
-      <span class="file-icon">${fileIcon(f.name)}</span>
-      <div class="file-info"><div class="file-name">${f.name}</div><div class="file-size">${fileSize(f.size)}</div></div>
-      <button class="file-remove" onclick="removePendingFile('${f.id}')" title="Remove">✕</button>
-    </div>`).join('');
-}
-
-// Drag-and-drop zone
-document.addEventListener('DOMContentLoaded', () => {
-  const zone = document.getElementById('uploadZone');
-  if (!zone) return;
-  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
-  zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
-  zone.addEventListener('drop', e => {
-    e.preventDefault(); zone.classList.remove('drag-over');
-    const dt = e.dataTransfer;
-    if (dt && dt.files.length) {
-      Array.from(dt.files).forEach(f => {
-        const reader = new FileReader();
-        reader.onload = ev => {
-          pendingFiles.push({ id:genDocId(), name:f.name, type:f.type, size:f.size, dataURL:ev.target.result, ext:(f.name.split('.').pop()||'').toLowerCase() });
-          renderPendingFiles();
-        };
-        reader.readAsDataURL(f);
-      });
-    }
-  });
-});
-
-// ══════════════════════════════════════════════════════════════
-// VIEW ROUTING
-// ══════════════════════════════════════════════════════════════
-function showView(name, skipHistory) {
-  if (!skipHistory && name !== 'detail') prevView = name;
-  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.getElementById('view-'+name).classList.add('active');
-  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
-  const tabs = document.querySelectorAll('.nav-tab');
-  if (name==='dashboard') tabs[0].classList.add('active');
-  if (name==='submit')    tabs[1].classList.add('active');
-  if (name==='portal')  { tabs[2].classList.add('active'); renderPortal(); }
-  if (name==='dashboard') { updateKPIs(); renderBoard(); }
-  document.getElementById('roleMenu').classList.add('hidden');
-}
-
-function goBack() { showView(prevView); }
-
-// ══════════════════════════════════════════════════════════════
-// ROLE SWITCHING
-// ══════════════════════════════════════════════════════════════
-function toggleRoleMenu() { document.getElementById('roleMenu').classList.toggle('hidden'); }
-function setRole(role) {
-  currentRole = role;
-  const r = ROLE_MAP[role];
-  document.getElementById('rolePill').textContent = r.icon+' '+r.label+' ▾';
-  document.getElementById('roleMenu').classList.add('hidden');
-  toast('Switched to '+r.label+' view','info');
-  renderPortal();
-  if (activeReqId) renderDetail(activeReqId);
-}
-document.addEventListener('click', e => {
-  if (!e.target.closest('#roleMenu') && !e.target.closest('#rolePill'))
-    document.getElementById('roleMenu').classList.add('hidden');
-});
-
-// ══════════════════════════════════════════════════════════════
-// SUBMIT
-// ══════════════════════════════════════════════════════════════
-function submitRequest() {
-  const name  = document.getElementById('fName').value.trim();
-  const sid   = document.getElementById('fId').value.trim();
-  const dept  = document.getElementById('fDept').value;
-  const date  = document.getElementById('fDate').value;
-  const reason= document.getElementById('fReason').value;
-  const notes = document.getElementById('fNotes').value.trim();
-  const sup   = document.getElementById('fSupervisor').value.trim();
-  const allChecked = ['chk1','chk2','chk3','chk4','chk5'].every(id=>document.getElementById(id).checked);
-
-  if (!name||!sid||!dept||!date||!reason) { toast('Please fill all required fields','error'); return; }
-  if (!allChecked) { toast('Please complete all checklist items','error'); return; }
-
-  // Attach uploaded files to the request as "submitted" documents
-  const submittedDocs = pendingFiles.map(f => ({
-    ...f, id:genDocId(), category:'submitted', uploadedBy:'Staff Member ('+name+')', uploadedAt:nowFull()
-  }));
-
-  const req = {
-    id:genId(), name, staffId:sid, dept, date, reason, notes, supervisor:sup,
-    submitted:nowFull(), status:'active', currentUnit:0,
-    units:UNITS.map(u=>({...u,status:'waiting',timestamp:null,comment:'',approver:''})),
-    timeline:[{event:'Clearance Request Submitted',time:nowFull(),note:'Exit: '+date+' · Reason: '+reason+(submittedDocs.length?' · '+submittedDocs.length+' document(s) uploaded':''),color:'#1CABE2'}],
-    documents:submittedDocs,
-    slaStart:Date.now(), escalated:false,
+  /* ─────────────────────────────────────────────────────────────
+   * ROLE MAP
+   * Maps each role key to a display label, icon, and the index of
+   * the UNITS array this role is responsible for approving.
+   * unitIdx: null means the role has read-only access to all units
+   * (HR Manager overview, Staff self-service).
+   * ───────────────────────────────────────────────────────────── */
+  const ROLE_MAP = {
+    hr:       { label: 'HR Manager',          icon: '👤',  unitIdx: null },
+    admin:    { label: 'Admin Officer',        icon: '🏢',  unitIdx: 0    },
+    security: { label: 'Security Officer',     icon: '🛡️',  unitIdx: 1    },
+    ict:      { label: 'ICT Officer',          icon: '💻',  unitIdx: 2    },
+    finance:  { label: 'Finance Officer',      icon: '💰',  unitIdx: 3    },
+    hrunit:   { label: 'HR Clearance Officer', icon: '✅',  unitIdx: 4    },
+    staff:    { label: 'Staff Member',         icon: '🧑‍💼', unitIdx: null },
   };
-  req.units[0].status = 'current';
 
-  requests.unshift(req);
-  pendingFiles = [];
-  renderPendingFiles();
-  startSLATimer(req.id);
-  updateKPIs(); renderBoard();
-
-  ['fName','fId','fNotes','fSupervisor'].forEach(id=>document.getElementById(id).value='');
-  ['fDept','fReason'].forEach(id=>document.getElementById(id).value='');
-  document.getElementById('fDate').value='';
-  ['chk1','chk2','chk3','chk4','chk5'].forEach(id=>document.getElementById(id).checked=false);
-
-  toast('Workflow launched for '+name+' — routed to Administration','success');
-  showView('dashboard');
-}
-
-// ══════════════════════════════════════════════════════════════
-// SLA
-// ══════════════════════════════════════════════════════════════
-function startSLATimer(reqId) {
-  if (slaTimers[reqId]) clearInterval(slaTimers[reqId]);
-  slaTimers[reqId] = setInterval(()=>{
-    const req=requests.find(r=>r.id===reqId);
-    if (!req||req.status!=='active'){clearInterval(slaTimers[reqId]);return;}
-    const elapsed=Date.now()-req.slaStart;
-    if (elapsed>SLA_MINUTES*60000&&!req.escalated){req.escalated=true;triggerEscalation(req);}
-    if (document.getElementById('view-detail').classList.contains('active')&&activeReqId===reqId)
-      updateSLADisplay(reqId);
-  },1000);
-}
-function triggerEscalation(req) {
-  const unit=UNITS[req.currentUnit];
-  req.timeline.push({event:'⚠️ SLA Breach — Escalated',time:nowFull(),note:unit.name+' exceeded the '+SLA_MINUTES+'-minute SLA. Supervisor notified.',color:'#F5A623'});
-  escPending=req;
-  document.getElementById('escBody').innerHTML='<strong>'+req.name+'</strong>\'s clearance has been stuck at <strong>'+unit.name+'</strong> for over <strong>'+SLA_MINUTES+' minute(s)</strong>. The supervisor has been automatically notified.';
-  document.getElementById('escModal').classList.remove('hidden');
-  toast('⚠️ SLA breached — '+req.name+' at '+unit.name,'warn');
-}
-function dismissEscalation(){document.getElementById('escModal').classList.add('hidden');if(escPending){escPending.escalated=true;escPending=null;}}
-function updateSLADisplay(reqId){
-  const req=requests.find(r=>r.id===reqId);if(!req)return;
-  const ms=Date.now()-req.slaStart,slaMs=SLA_MINUTES*60000;
-  const pct=Math.min((ms/slaMs)*100,100);
-  document.querySelectorAll('.sla-live-bar').forEach(b=>{b.style.width=pct+'%';b.style.background=pct>100?'#FF4D6D':pct>70?'#F5A623':'#00C896';});
-  document.querySelectorAll('.sla-live-label').forEach(l=>{
-    const rem=Math.max(slaMs-ms,0);
-    l.textContent=pct>=100?'⚠️ SLA Breached':'SLA: '+Math.ceil(rem/1000)+'s remaining';
-    l.className='sla-live-label sla-timer'+(pct>=100?' overdue':'');
-  });
-}
-
-// ══════════════════════════════════════════════════════════════
-// UNIT CLEARANCE SLIP GENERATOR
-// ══════════════════════════════════════════════════════════════
-function generateUnitSlip(req, unitIdx, comment, approver) {
-  const u = UNITS[unitIdx];
-  const slipId = 'SLP-'+u.id.toUpperCase()+'-'+Date.now().toString(36).toUpperCase().slice(-4);
-  const html = `<div class="unit-slip">
-    <div class="slip-header">
-      <div class="slip-org">UNICEF · Country Office Nigeria</div>
-      <div class="slip-title">${u.name} Unit Clearance Slip</div>
-      <div class="slip-sub">${u.role} — Auto-generated upon approval</div>
-    </div>
-    <div class="slip-body">
-      <div class="slip-status">✓ CLEARED</div>
-      <div class="slip-row"><span class="slip-row-label">Staff Name:</span><span class="slip-row-val">${req.name}</span></div>
-      <div class="slip-row"><span class="slip-row-label">Staff ID:</span><span class="slip-row-val">${req.staffId}</span></div>
-      <div class="slip-row"><span class="slip-row-label">Department:</span><span class="slip-row-val">${req.dept}</span></div>
-      <div class="slip-row"><span class="slip-row-label">Exit Date:</span><span class="slip-row-val">${req.date}</span></div>
-      <div class="slip-row"><span class="slip-row-label">Clearance Unit:</span><span class="slip-row-val">${u.name}</span></div>
-      <div class="slip-row"><span class="slip-row-label">Cleared By:</span><span class="slip-row-val">${approver}</span></div>
-      <div class="slip-row"><span class="slip-row-label">Date &amp; Time:</span><span class="slip-row-val">${nowFull()}</span></div>
-      <div class="slip-row"><span class="slip-row-label">Remarks:</span><span class="slip-row-val">${comment}</span></div>
-    </div>
-    <div class="slip-footer">
-      <div class="slip-seal">🔏</div>
-      <div class="slip-ref">${slipId} · Request: ${req.id}</div>
-      <div>UNICEF CO Nigeria</div>
-    </div>
-  </div>`;
-  return {
-    id: genDocId(),
-    name: u.name+' Clearance Slip',
-    category: 'generated',
-    unit: u.id,
-    unitName: u.name,
-    uploadedBy: approver,
-    uploadedAt: nowFull(),
-    html: html,
-    slipId: slipId,
+  /* ─────────────────────────────────────────────────────────────
+   * FILE TYPE ICON MAP
+   * Returns a representative emoji for a given file extension.
+   * Used in the document repository and upload staging list.
+   * ───────────────────────────────────────────────────────────── */
+  const FILE_ICONS = {
+    pdf: '📄', doc: '📝', docx: '📝',
+    jpg: '🖼️', jpeg: '🖼️', png: '🖼️',
+    msg: '📧', eml: '📧',
+    default: '📎',
   };
-}
 
-// ══════════════════════════════════════════════════════════════
-// APPROVE / REJECT
-// ══════════════════════════════════════════════════════════════
-function approveUnit(reqId) {
-  const req=requests.find(r=>r.id===reqId);
-  if (!req||req.status!=='active') return;
-  const comment=document.getElementById('actionComment').value.trim()||'Approved — no comments';
-  const u=req.units[req.currentUnit];
-  const r=ROLE_MAP[currentRole];
-
-  u.status='approved'; u.timestamp=nowFull(); u.comment=comment; u.approver=r.label;
-
-  // Auto-generate unit clearance slip
-  const slip = generateUnitSlip(req, req.currentUnit, comment, r.label);
-  req.documents.push(slip);
-
-  req.timeline.push({event:u.name+' ✓ Approved',time:nowFull(),note:r.label+': "'+comment+'" · Clearance slip auto-generated.',color:'#00C896'});
-  req.slaStart=Date.now(); req.escalated=false;
-
-  if (req.currentUnit===UNITS.length-1) {
-    req.status='cleared'; req.clearedAt=nowFull();
-    clearInterval(slaTimers[req.id]);
-    // Auto-generate final exit clearance certificate document
-    const finalDoc = {
-      id:genDocId(), name:'Final Exit Clearance Certificate', category:'final',
-      unit:'hr', unitName:'Human Resources', uploadedBy:r.label, uploadedAt:nowFull(),
-      html: buildFinalCertHTML(req),
-    };
-    req.documents.push(finalDoc);
-    req.timeline.push({event:'🎉 Clearance Complete',time:nowFull(),note:'All 5 units approved. Final certificate auto-issued and stored in document repository.',color:'#00C896'});
-    toast(req.name+' is fully cleared! Certificate generated.','success');
-  } else {
-    req.currentUnit++;
-    req.units[req.currentUnit].status='current';
-    toast(u.name+' approved → forwarded to '+UNITS[req.currentUnit].name,'success');
+  /**
+   * Returns an emoji icon for a filename based on its extension.
+   * @param {string} name - The filename (e.g. "letter.pdf")
+   * @returns {string} Emoji icon
+   */
+  function fileIcon(name) {
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    return FILE_ICONS[ext] || FILE_ICONS.default;
   }
 
-  updateKPIs(); renderBoard(); renderDetail(req.id);
-  const ac=document.getElementById('actionComment');if(ac)ac.value='';
-}
+  /**
+   * Formats a byte count into a human-readable file size string.
+   * @param {number} bytes
+   * @returns {string} e.g. "245 KB" or "1.2 MB"
+   */
+  function fileSize(bytes) {
+    return bytes > 1048576
+      ? (bytes / 1048576).toFixed(1) + ' MB'
+      : (bytes / 1024).toFixed(0) + ' KB';
+  }
 
-function rejectUnit(reqId) {
-  const req=requests.find(r=>r.id===reqId);
-  if (!req||req.status!=='active') return;
-  const comment=document.getElementById('actionComment').value.trim();
-  if (!comment){toast('A rejection reason is required','error');return;}
+  /**
+   * Generates a unique clearance request ID using the current
+   * timestamp encoded in base-36 (e.g. "CLR-K3X9F2").
+   * @returns {string}
+   */
+  function genId() {
+    return 'CLR-' + Date.now().toString(36).toUpperCase().slice(-6);
+  }
 
-  const u=req.units[req.currentUnit];
-  const r=ROLE_MAP[currentRole];
-  u.status='rejected'; u.timestamp=nowFull(); u.comment=comment; u.approver=r.label;
-  req.status='needs-action';
-  clearInterval(slaTimers[req.id]);
-  req.timeline.push({event:u.name+' ✗ Returned',time:nowFull(),note:r.label+': "'+comment+'"',color:'#FF4D6D'});
-  toast('Returned to staff member by '+u.name,'error');
-  updateKPIs(); renderBoard(); renderDetail(req.id);
-}
+  /**
+   * Generates a unique document ID for repository entries.
+   * @returns {string} e.g. "DOC-A4F2B"
+   */
+  function genDocId() {
+    return 'DOC-' + Date.now().toString(36).toUpperCase().slice(-5);
+  }
 
-function resubmit(reqId) {
-  const req=requests.find(r=>r.id===reqId);if(!req)return;
-  const u=req.units[req.currentUnit];
-  u.status='current'; u.comment=''; u.timestamp=null; u.approver='';
-  req.status='active'; req.slaStart=Date.now(); req.escalated=false;
-  req.timeline.push({event:'↩ Resubmitted',time:nowFull(),note:'Staff resubmitted for review at '+u.name+'.',color:'#1CABE2'});
-  startSLATimer(req.id);
-  toast('Resubmitted to '+u.name,'info');
-  updateKPIs(); renderBoard(); renderDetail(req.id);
-}
+  /**
+   * Returns the current date and time formatted for audit trail
+   * entries (e.g. "31/05/2026, 09:20:00").
+   * @returns {string}
+   */
+  function nowFull() {
+    return new Date().toLocaleString('en-GB', { dateStyle: 'short', timeStyle: 'medium' });
+  }
 
-// ══════════════════════════════════════════════════════════════
-// KPI & BOARD
-// ══════════════════════════════════════════════════════════════
-function updateKPIs() {
-  document.getElementById('kpiTotal').textContent   = requests.length;
-  document.getElementById('kpiActive').textContent  = requests.filter(r=>r.status==='active').length;
-  document.getElementById('kpiCleared').textContent = requests.filter(r=>r.status==='cleared').length;
-  document.getElementById('kpiNeeds').textContent   = requests.filter(r=>r.status==='needs-action').length;
-}
-function renderBoard() {
-  const el=document.getElementById('boardBody');
-  if (!requests.length){el.innerHTML='<div style="padding:2rem;text-align:center;color:var(--dim);font-size:13px">No clearance requests yet — submit one to begin.</div>';return;}
-  el.innerHTML=requests.map(r=>{
-    const dots=UNITS.map((u,i)=>{
-      const us=r.units[i];
-      const cls=us.status==='approved'?'dot-done':us.status==='current'?'dot-active':us.status==='rejected'?'dot-reject':'dot-wait';
-      const ic=us.status==='approved'?'✓':us.status==='current'?'●':us.status==='rejected'?'✗':i+1;
-      return '<div class="stage-dot '+cls+'">'+ic+'</div>';
+  /* ─────────────────────────────────────────────────────────────
+   * FILE UPLOAD — STAGING BEFORE SUBMISSION
+   * Files are read into memory as base-64 data URLs using the
+   * FileReader API. They are stored in the pendingFiles array
+   * until the staff member submits the form, at which point they
+   * are transferred to the request's documents array as
+   * category: 'submitted' entries visible to all approval units.
+   * ───────────────────────────────────────────────────────────── */
+
+  /**
+   * Handles the file input change event.
+   * Reads each selected file into a data URL and adds it to the
+   * staging array, then refreshes the upload preview list.
+   * @param {Event} e - The change event from the file input
+   */
+  function handleFileSelect(e) {
+    const files = Array.from(e.target.files);
+
+    files.forEach(file => {
+      const reader = new FileReader();
+
+      reader.onload = (ev) => {
+        pendingFiles.push({
+          id:      genDocId(),
+          name:    file.name,
+          type:    file.type,
+          size:    file.size,
+          dataURL: ev.target.result,
+          ext:     (file.name.split('.').pop() || '').toLowerCase(),
+        });
+        renderPendingFiles();
+      };
+
+      reader.readAsDataURL(file);
     });
-    const bc={active:'badge-active',cleared:'badge-cleared','needs-action':'badge-needs'}[r.status]||'badge-pending';
-    const bt={active:'In Progress',cleared:'Cleared','needs-action':'Action Needed'}[r.status]||r.status;
-    return '<div class="board-row" onclick="openDetail(\''+r.id+'\')">'
-      +'<div><div class="board-name">'+r.name+'</div><div class="board-dept">'+r.staffId+'</div></div>'
-      +'<div style="font-size:12px;color:var(--dim)">'+r.dept+'</div>'
-      +dots.join('')
-      +'<span class="badge '+bc+'">'+bt+'</span></div>';
-  }).join('');
-}
 
-// ══════════════════════════════════════════════════════════════
-// DETAIL
-// ══════════════════════════════════════════════════════════════
-function openDetail(id) {
-  activeReqId=id;
-  prevView=document.querySelector('.nav-tab.active')?.textContent.trim().toLowerCase().includes('portal')?'portal':'dashboard';
-  renderDetail(id); showView('detail',true);
-}
+    // Reset input so the same file can be re-selected if removed
+    e.target.value = '';
+  }
+
+  /**
+   * Removes a staged (not yet submitted) file from pendingFiles
+   * and re-renders the upload preview list.
+   * @param {string} id - The document ID assigned during staging
+   */
+  function removePendingFile(id) {
+    pendingFiles = pendingFiles.filter(f => f.id !== id);
+    renderPendingFiles();
+  }
+
+  /**
+   * Renders the list of staged files below the upload zone.
+   * Shows filename, size, and a remove button for each file.
+   */
+  function renderPendingFiles() {
+    const el = document.getElementById('uploadedFilesList');
+
+    if (!pendingFiles.length) {
+      el.innerHTML = '';
+      return;
+    }
+
+    el.innerHTML = pendingFiles.map(f => `
+      <div class="uploaded-file-item">
+        <span class="file-icon">${fileIcon(f.name)}</span>
+        <div class="file-info">
+          <div class="file-name">${f.name}</div>
+          <div class="file-size">${fileSize(f.size)}</div>
+        </div>
+        <button class="file-remove" onclick="removePendingFile('${f.id}')" title="Remove">✕</button>
+      </div>`).join('');
+  }
+
+  /**
+   * Wires up drag-and-drop behaviour on the upload zone.
+   * Files dropped onto the zone are processed identically to
+   * files selected through the file input dialog.
+   */
+  document.addEventListener('DOMContentLoaded', () => {
+    const zone = document.getElementById('uploadZone');
+    if (!zone) return;
+
+    // Highlight the zone while a file is dragged over it
+    zone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      zone.classList.add('drag-over');
+    });
+
+    zone.addEventListener('dragleave', () => {
+      zone.classList.remove('drag-over');
+    });
+
+    // Process dropped files the same way as the file input
+    zone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      zone.classList.remove('drag-over');
+
+      const droppedFiles = e.dataTransfer && e.dataTransfer.files;
+      if (!droppedFiles || !droppedFiles.length) return;
+
+      Array.from(droppedFiles).forEach(file => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          pendingFiles.push({
+            id:      genDocId(),
+            name:    file.name,
+            type:    file.type,
+            size:    file.size,
+            dataURL: ev.target.result,
+            ext:     (file.name.split('.').pop() || '').toLowerCase(),
+          });
+          renderPendingFiles();
+        };
+        reader.readAsDataURL(file);
+      });
+    });
+  });
+
+  /* ─────────────────────────────────────────────────────────────
+   * VIEW ROUTING
+   * The prototype is a single-page application with four named
+   * views: dashboard, submit, portal, detail.
+   * showView() is the central router — it hides all views, shows
+   * the requested one, and synchronises the active nav tab.
+   * prevView is stored so the back button returns to the correct
+   * parent view (dashboard or portal) from the detail view.
+   * ───────────────────────────────────────────────────────────── */
+
+  /**
+   * Switches the visible view and updates the navigation tab state.
+   * @param {string}  name        - Target view name: 'dashboard' | 'submit' | 'portal' | 'detail'
+   * @param {boolean} skipHistory - When true, prevView is NOT updated (used when navigating
+   *                                to 'detail' so the back button keeps the correct parent)
+   */
+  function showView(name, skipHistory) {
+    // Remember the last non-detail view for the back button
+    if (!skipHistory && name !== 'detail') {
+      prevView = name;
+    }
+
+    // Hide all views, then show only the requested one
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    document.getElementById('view-' + name).classList.add('active');
+
+    // Sync nav tab highlight
+    const tabs = document.querySelectorAll('.nav-tab');
+    tabs.forEach(t => t.classList.remove('active'));
+    if (name === 'dashboard') { tabs[0].classList.add('active'); updateKPIs(); renderBoard(); }
+    if (name === 'submit')      tabs[1].classList.add('active');
+    if (name === 'portal')    { tabs[2].classList.add('active'); renderPortal(); }
+
+    // Close role menu if open
+    document.getElementById('roleMenu').classList.add('hidden');
+  }
+
+  /**
+   * Navigates back to the view that was active before the detail
+   * view was opened (either dashboard or portal).
+   */
+  function goBack() {
+    showView(prevView);
+  }
+
+
+  /* ─────────────────────────────────────────────────────────────
+   * ROLE SWITCHING
+   * Simulates switching between different user accounts.
+   * In the real SharePoint system each person logs in with their
+   * own M365 account and sees only their unit's queue.
+   * Here, a dropdown menu lets the demo presenter switch roles
+   * to show each unit's perspective without separate logins.
+   * ───────────────────────────────────────────────────────────── */
+
+  /**
+   * Toggles the role selection dropdown open or closed.
+   */
+  function toggleRoleMenu() {
+    document.getElementById('roleMenu').classList.toggle('hidden');
+  }
+
+  /**
+   * Switches the active role and refreshes all role-sensitive views.
+   * Changing role affects which action buttons appear in the detail
+   * view and which queue items appear in the unit portal.
+   * @param {string} role - A key from ROLE_MAP (e.g. 'admin', 'ict')
+   */
+  function setRole(role) {
+    currentRole = role;
+    const roleInfo = ROLE_MAP[role];
+
+    // Update the header pill to reflect the active role
+    document.getElementById('rolePill').textContent = roleInfo.icon + ' ' + roleInfo.label + ' ▾';
+    document.getElementById('roleMenu').classList.add('hidden');
+
+    toast('Switched to ' + roleInfo.label + ' view', 'info');
+
+    // Re-render views that depend on role
+    renderPortal();
+    if (activeReqId) renderDetail(activeReqId);
+  }
+
+  // Close the role menu when clicking anywhere outside it
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#roleMenu') && !e.target.closest('#rolePill')) {
+      document.getElementById('roleMenu').classList.add('hidden');
+    }
+  });
+
+  /* ─────────────────────────────────────────────────────────────
+   * CLEARANCE REQUEST SUBMISSION
+   * Validates the form, assembles the request data object, and
+   * launches the sequential approval workflow.
+   *
+   * In production, submitting the SharePoint form would trigger
+   * a Power Automate cloud flow that:
+   *   1. Creates a list item for the clearance request
+   *   2. Stores uploaded documents in a SharePoint document library
+   *   3. Sends an approval email to the Administration unit
+   * ───────────────────────────────────────────────────────────── */
+
+  /**
+   * Reads, validates, and submits the new clearance request form.
+   * Creates the request object, attaches staged documents, sets the
+   * first unit (Administration) to 'current', starts the SLA timer,
+   * and redirects to the dashboard.
+   */
+  function submitRequest() {
+    // Collect all form field values
+    const name       = document.getElementById('fName').value.trim();
+    const staffId    = document.getElementById('fId').value.trim();
+    const dept       = document.getElementById('fDept').value;
+    const date       = document.getElementById('fDate').value;
+    const reason     = document.getElementById('fReason').value;
+    const notes      = document.getElementById('fNotes').value.trim();
+    const supervisor = document.getElementById('fSupervisor').value.trim();
+
+    // All five checklist items must be ticked before submission
+    const allChecked = ['chk1','chk2','chk3','chk4','chk5']
+      .every(id => document.getElementById(id).checked);
+
+    // Validate required fields
+    if (!name || !staffId || !dept || !date || !reason) {
+      toast('Please fill all required fields', 'error');
+      return;
+    }
+    if (!allChecked) {
+      toast('Please complete all checklist items', 'error');
+      return;
+    }
+
+    // Transfer staged files into the request as 'submitted' documents.
+    // These will be visible to all five clearance units.
+    const submittedDocs = pendingFiles.map(f => ({
+      ...f,
+      id:         genDocId(),
+      category:   'submitted',
+      uploadedBy: 'Staff Member (' + name + ')',
+      uploadedAt: nowFull(),
+    }));
+
+    // Build the clearance request object.
+    // Each unit starts as 'waiting'; Administration is set to 'current'
+    // immediately to indicate it is awaiting the first approval.
+    const req = {
+      id:         genId(),
+      name,
+      staffId,
+      dept,
+      date,
+      reason,
+      notes,
+      supervisor,
+      submitted:   nowFull(),
+      status:      'active',       // 'active' | 'needs-action' | 'cleared'
+      currentUnit: 0,              // Index into UNITS[] — advances on each approval
+      units:       UNITS.map(u => ({
+        ...u,
+        status:    'waiting',      // 'waiting' | 'current' | 'approved' | 'rejected'
+        timestamp: null,
+        comment:   '',
+        approver:  '',
+      })),
+      timeline:  [{
+        event: 'Clearance Request Submitted',
+        time:  nowFull(),
+        note:  'Exit: ' + date + ' · Reason: ' + reason +
+               (submittedDocs.length ? ' · ' + submittedDocs.length + ' document(s) uploaded' : ''),
+        color: '#1CABE2',
+      }],
+      documents:  submittedDocs,
+      slaStart:   Date.now(),   // Timestamp when the current unit's SLA clock started
+      escalated:  false,        // Prevents repeated escalation alerts for the same breach
+    };
+
+    // Activate the first unit (Administration)
+    req.units[0].status = 'current';
+
+    // Add to the top of the requests list (newest first)
+    requests.unshift(req);
+
+    // Clear staged files and reset the form for the next submission
+    pendingFiles = [];
+    renderPendingFiles();
+    ['fName', 'fId', 'fNotes', 'fSupervisor'].forEach(id => document.getElementById(id).value = '');
+    ['fDept', 'fReason'].forEach(id => document.getElementById(id).value = '');
+    document.getElementById('fDate').value = '';
+    ['chk1','chk2','chk3','chk4','chk5'].forEach(id => document.getElementById(id).checked = false);
+
+    // Start the SLA countdown for the Administration unit
+    startSLATimer(req.id);
+
+    updateKPIs();
+    renderBoard();
+    toast('Workflow launched for ' + name + ' — routed to Administration', 'success');
+    showView('dashboard');
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+   * SLA (SERVICE LEVEL AGREEMENT) ENGINE
+   * Each approval unit has a time limit to act on a request.
+   * In production this is 48 hours, enforced by a Power Automate
+   * scheduled trigger. Here it is set to SLA_MINUTES (2 min) so
+   * the escalation behaviour can be demonstrated live.
+   *
+   * When the SLA is breached:
+   *   1. An escalation entry is added to the audit trail
+   *   2. A warning modal is shown to the demo presenter
+   *   3. The escalated flag is set to prevent repeated alerts
+   *
+   * The timer is reset (req.slaStart = Date.now()) each time a
+   * unit approves, so each unit gets a fresh SLA window.
+   * ───────────────────────────────────────────────────────────── */
+
+  /**
+   * Starts (or restarts) the SLA countdown timer for a request.
+   * Fires every second to:
+   *   - Check whether the SLA threshold has been exceeded
+   *   - Refresh the live progress bar in the detail view
+   * The interval is stopped automatically when the request is
+   * no longer active (cleared or returned).
+   * @param {string} reqId - The clearance request ID
+   */
+  function startSLATimer(reqId) {
+    // Clear any existing timer for this request before starting a new one
+    if (slaTimers[reqId]) clearInterval(slaTimers[reqId]);
+
+    slaTimers[reqId] = setInterval(() => {
+      const req = requests.find(r => r.id === reqId);
+
+      // Stop the timer if the request is no longer in progress
+      if (!req || req.status !== 'active') {
+        clearInterval(slaTimers[reqId]);
+        return;
+      }
+
+      const elapsed = Date.now() - req.slaStart;
+      const slaMs   = SLA_MINUTES * 60 * 1000;
+
+      // Trigger escalation once when the SLA window is exceeded
+      if (elapsed > slaMs && !req.escalated) {
+        req.escalated = true;
+        triggerEscalation(req);
+      }
+
+      // Only update the live progress bar if the detail view is open
+      // for this specific request — avoids unnecessary DOM work
+      const detailVisible = document.getElementById('view-detail').classList.contains('active');
+      if (detailVisible && activeReqId === reqId) {
+        updateSLADisplay(reqId);
+      }
+    }, 1000);
+  }
+
+  /**
+   * Fires when an SLA breach is detected.
+   * Records the breach in the audit trail, stores the pending
+   * escalation reference, and shows the escalation modal.
+   * @param {object} req - The clearance request object
+   */
+  function triggerEscalation(req) {
+    const unit = UNITS[req.currentUnit];
+
+    // Audit trail entry for the breach
+    req.timeline.push({
+      event: '⚠️ SLA Breach — Escalated',
+      time:  nowFull(),
+      note:  unit.name + ' exceeded the ' + SLA_MINUTES + '-minute SLA. Supervisor notified.',
+      color: '#F5A623',
+    });
+
+    // Store a reference so the dismiss handler can mark it resolved
+    escPending = req;
+
+    document.getElementById('escBody').innerHTML =
+      '<strong>' + req.name + '</strong>\'s clearance has been stuck at ' +
+      '<strong>' + unit.name + '</strong> for over <strong>' + SLA_MINUTES +
+      ' minute(s)</strong>. The supervisor has been automatically notified.';
+
+    document.getElementById('escModal').classList.remove('hidden');
+    toast('⚠️ SLA breached — ' + req.name + ' at ' + unit.name, 'warn');
+  }
+
+  /**
+   * Closes the SLA escalation modal when the user acknowledges.
+   * Marks the pending escalation as resolved to prevent re-display.
+   */
+  function dismissEscalation() {
+    document.getElementById('escModal').classList.add('hidden');
+    if (escPending) {
+      escPending.escalated = true;
+      escPending = null;
+    }
+  }
+
+  /**
+   * Refreshes the live SLA progress bar and countdown label in the
+   * detail view. Called every second by the SLA timer interval.
+   * Colour transitions: green → amber (>70%) → red (breached).
+   * @param {string} reqId - The clearance request ID
+   */
+  function updateSLADisplay(reqId) {
+    const req   = requests.find(r => r.id === reqId);
+    if (!req) return;
+
+    const elapsed = Date.now() - req.slaStart;
+    const slaMs   = SLA_MINUTES * 60 * 1000;
+    const pct     = Math.min((elapsed / slaMs) * 100, 100); // Cap at 100%
+
+    // Update progress bar width and colour
+    document.querySelectorAll('.sla-live-bar').forEach(bar => {
+      bar.style.width      = pct + '%';
+      bar.style.background = pct > 100 ? '#FF4D6D' : pct > 70 ? '#F5A623' : '#00C896';
+    });
+
+    // Update countdown label text
+    document.querySelectorAll('.sla-live-label').forEach(label => {
+      const remaining = Math.max(slaMs - elapsed, 0);
+      label.textContent = pct >= 100
+        ? '⚠️ SLA Breached'
+        : 'SLA: ' + Math.ceil(remaining / 1000) + 's remaining';
+      label.className = 'sla-live-label sla-timer' + (pct >= 100 ? ' overdue' : '');
+    });
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+   * UNIT CLEARANCE SLIP GENERATOR
+   * When a unit officer approves a request, the system immediately
+   * generates a formatted clearance slip and stores it in the
+   * request's document repository.
+   *
+   * This slip is then visible to all subsequent approval units,
+   * so each team can see the confirmation from prior stages before
+   * making their own decision. The slip is stored as an HTML
+   * string and rendered inline in the document viewer modal.
+   *
+   * In the real Power Automate system, this would be a Word/PDF
+   * document auto-populated from a template and stored in the
+   * SharePoint document library linked to the list item.
+   * ───────────────────────────────────────────────────────────── */
+
+  /**
+   * Generates a formatted HTML clearance slip for a specific unit's
+   * approval and returns it as a document repository entry.
+   *
+   * @param {object} req      - The clearance request object
+   * @param {number} unitIdx  - Index of the approving unit in UNITS[]
+   * @param {string} comment  - The approver's remarks
+   * @param {string} approver - Display name of the approver (from ROLE_MAP)
+   * @returns {object} A document entry ready to push into req.documents
+   */
+  function generateUnitSlip(req, unitIdx, comment, approver) {
+    const unit   = UNITS[unitIdx];
+    const slipId = 'SLP-' + unit.id.toUpperCase() + '-' +
+                   Date.now().toString(36).toUpperCase().slice(-4);
+
+    // Build the HTML content of the clearance slip.
+    // This renders as a white-background printable document inside
+    // the dark-themed document viewer modal.
+    const html = `
+      <div class="unit-slip">
+        <div class="slip-header">
+          <div class="slip-org">UNICEF · Country Office Nigeria</div>
+          <div class="slip-title">${unit.name} Unit Clearance Slip</div>
+          <div class="slip-sub">${unit.role} — Auto-generated upon approval</div>
+        </div>
+        <div class="slip-body">
+          <div class="slip-status">✓ CLEARED</div>
+          <div class="slip-row"><span class="slip-row-label">Staff Name:</span>     <span class="slip-row-val">${req.name}</span></div>
+          <div class="slip-row"><span class="slip-row-label">Staff ID:</span>        <span class="slip-row-val">${req.staffId}</span></div>
+          <div class="slip-row"><span class="slip-row-label">Department:</span>      <span class="slip-row-val">${req.dept}</span></div>
+          <div class="slip-row"><span class="slip-row-label">Exit Date:</span>       <span class="slip-row-val">${req.date}</span></div>
+          <div class="slip-row"><span class="slip-row-label">Clearance Unit:</span>  <span class="slip-row-val">${unit.name}</span></div>
+          <div class="slip-row"><span class="slip-row-label">Cleared By:</span>      <span class="slip-row-val">${approver}</span></div>
+          <div class="slip-row"><span class="slip-row-label">Date &amp; Time:</span> <span class="slip-row-val">${nowFull()}</span></div>
+          <div class="slip-row"><span class="slip-row-label">Remarks:</span>         <span class="slip-row-val">${comment}</span></div>
+        </div>
+        <div class="slip-footer">
+          <div class="slip-seal">🔏</div>
+          <div class="slip-ref">${slipId} · Request: ${req.id}</div>
+          <div>UNICEF CO Nigeria</div>
+        </div>
+      </div>`;
+
+    // Return a document repository entry object
+    return {
+      id:         genDocId(),
+      name:       unit.name + ' Clearance Slip',
+      category:   'generated',      // Distinguishes from 'submitted' (staff uploads) and 'final' (HR certificate)
+      unit:       unit.id,
+      unitName:   unit.name,
+      uploadedBy: approver,
+      uploadedAt: nowFull(),
+      html,                         // Rendered directly in the document viewer modal
+      slipId,
+    };
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+   * SEQUENTIAL APPROVAL ENGINE — APPROVE / REJECT / RESUBMIT
+   *
+   * approveUnit()  — Marks the current unit as approved, generates
+   *                  its clearance slip, and either advances to the
+   *                  next unit or issues the final certificate if
+   *                  HR (the last unit) has just approved.
+   *
+   * rejectUnit()   — Returns the request to the staff member with
+   *                  a mandatory rejection reason. The flow pauses
+   *                  at the same unit stage; no prior approvals
+   *                  are lost.
+   *
+   * resubmit()     — Staff re-activates the paused request after
+   *                  addressing the rejection reason. The flow
+   *                  resumes at the same unit that returned it.
+   *
+   * The strict sequential order (Admin → Security → ICT →
+   * Finance → HR) is enforced by currentUnit advancing only on
+   * approval, never skipping ahead.
+   * ───────────────────────────────────────────────────────────── */
+
+  /**
+   * Processes an approval from the currently active unit.
+   * On final approval (HR), sets status to 'cleared' and generates
+   * the exit clearance certificate. Otherwise advances currentUnit
+   * and starts a fresh SLA window for the next unit.
+   * @param {string} reqId - The clearance request ID
+   */
+  function approveUnit(reqId) {
+    const req = requests.find(r => r.id === reqId);
+    if (!req || req.status !== 'active') return;
+
+    const comment    = document.getElementById('actionComment').value.trim() || 'Approved — no comments';
+    const unit       = req.units[req.currentUnit];
+    const roleInfo   = ROLE_MAP[currentRole];
+
+    // Mark this unit as approved with approver details
+    unit.status   = 'approved';
+    unit.timestamp = nowFull();
+    unit.comment  = comment;
+    unit.approver = roleInfo.label;
+
+    // Auto-generate and store the unit clearance slip in the document repository.
+    // Subsequent units will see this slip when reviewing the request.
+    const slip = generateUnitSlip(req, req.currentUnit, comment, roleInfo.label);
+    req.documents.push(slip);
+
+    req.timeline.push({
+      event: unit.name + ' ✓ Approved',
+      time:  nowFull(),
+      note:  roleInfo.label + ': "' + comment + '" · Clearance slip auto-generated.',
+      color: '#00C896',
+    });
+
+    // Reset the SLA clock for the next unit's window
+    req.slaStart  = Date.now();
+    req.escalated = false;
+
+    // Check if this was the final unit (HR)
+    if (req.currentUnit === UNITS.length - 1) {
+      // All five units have approved — mark request as fully cleared
+      req.status    = 'cleared';
+      req.clearedAt = nowFull();
+      clearInterval(slaTimers[req.id]);
+
+      // Auto-generate and store the final exit clearance certificate
+      req.documents.push({
+        id:         genDocId(),
+        name:       'Final Exit Clearance Certificate',
+        category:   'final',
+        unit:       'hr',
+        unitName:   'Human Resources',
+        uploadedBy: roleInfo.label,
+        uploadedAt: nowFull(),
+        html:       buildFinalCertHTML(req),
+      });
+
+      req.timeline.push({
+        event: '🎉 Clearance Complete',
+        time:  nowFull(),
+        note:  'All 5 units approved. Final certificate auto-issued and stored in document repository.',
+        color: '#00C896',
+      });
+      toast(req.name + ' is fully cleared! Certificate generated.', 'success');
+
+    } else {
+      // Advance to the next unit in the sequence
+      req.currentUnit++;
+      req.units[req.currentUnit].status = 'current';
+      toast(unit.name + ' approved → forwarded to ' + UNITS[req.currentUnit].name, 'success');
+    }
+
+    updateKPIs();
+    renderBoard();
+    renderDetail(req.id);
+
+    // Clear the comment field ready for the next action
+    const commentField = document.getElementById('actionComment');
+    if (commentField) commentField.value = '';
+  }
+
+  /**
+   * Returns a request to the staff member from the current unit.
+   * A rejection reason is mandatory — it is stored as the unit's
+   * comment and shown to the staff member in the needs-action panel.
+   * The SLA timer is stopped until the staff resubmits.
+   * @param {string} reqId - The clearance request ID
+   */
+  function rejectUnit(reqId) {
+    const req = requests.find(r => r.id === reqId);
+    if (!req || req.status !== 'active') return;
+
+    const comment  = document.getElementById('actionComment').value.trim();
+    if (!comment) {
+      toast('A rejection reason is required', 'error');
+      return;
+    }
+
+    const unit     = req.units[req.currentUnit];
+    const roleInfo = ROLE_MAP[currentRole];
+
+    unit.status   = 'rejected';
+    unit.timestamp = nowFull();
+    unit.comment  = comment;
+    unit.approver = roleInfo.label;
+
+    // Pause the workflow — staff must resolve the issue and resubmit
+    req.status = 'needs-action';
+    clearInterval(slaTimers[req.id]);
+
+    req.timeline.push({
+      event: unit.name + ' ✗ Returned',
+      time:  nowFull(),
+      note:  roleInfo.label + ': "' + comment + '"',
+      color: '#FF4D6D',
+    });
+
+    toast('Returned to staff member by ' + unit.name, 'error');
+    updateKPIs();
+    renderBoard();
+    renderDetail(req.id);
+  }
+
+  /**
+   * Reactivates a returned request after the staff member has
+   * addressed the rejection reason. Resumes from the same unit
+   * that returned it — no prior approvals are affected.
+   * @param {string} reqId - The clearance request ID
+   */
+  function resubmit(reqId) {
+    const req = requests.find(r => r.id === reqId);
+    if (!req) return;
+
+    const unit = req.units[req.currentUnit];
+
+    // Reset the unit back to 'current' state for re-review
+    unit.status    = 'current';
+    unit.comment   = '';
+    unit.timestamp = null;
+    unit.approver  = '';
+
+    req.status    = 'active';
+    req.slaStart  = Date.now();   // Fresh SLA window for the unit re-reviewing
+    req.escalated = false;
+
+    req.timeline.push({
+      event: '↩ Resubmitted',
+      time:  nowFull(),
+      note:  'Staff resubmitted for review at ' + unit.name + '.',
+      color: '#1CABE2',
+    });
+
+    startSLATimer(req.id);
+    toast('Resubmitted to ' + unit.name, 'info');
+    updateKPIs();
+    renderBoard();
+    renderDetail(req.id);
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+   * DASHBOARD — KPI CARDS & CLEARANCE BOARD
+   * The dashboard provides an at-a-glance view for HR Managers
+   * and administrators showing all requests and their stage.
+   * In SharePoint, this would be a Power BI-style dashboard page
+   * driven by a filtered view of the clearance list.
+   * ───────────────────────────────────────────────────────────── */
+
+  /**
+   * Refreshes the four KPI counter cards on the dashboard.
+   * Called after every state change (submit, approve, reject, resubmit).
+   */
+  function updateKPIs() {
+    document.getElementById('kpiTotal').textContent   = requests.length;
+    document.getElementById('kpiActive').textContent  = requests.filter(r => r.status === 'active').length;
+    document.getElementById('kpiCleared').textContent = requests.filter(r => r.status === 'cleared').length;
+    document.getElementById('kpiNeeds').textContent   = requests.filter(r => r.status === 'needs-action').length;
+  }
+
+  /**
+   * Renders the clearance board table on the dashboard.
+   * Each row shows a staff member's clearance request with per-unit
+   * status dots and an overall status badge.
+   * Clicking a row opens the full detail view for that request.
+   */
+  function renderBoard() {
+    const el = document.getElementById('boardBody');
+
+    if (!requests.length) {
+      el.innerHTML = '<div style="padding:2rem;text-align:center;color:var(--dim);font-size:13px">No clearance requests yet — submit one to begin.</div>';
+      return;
+    }
+
+    el.innerHTML = requests.map(req => {
+      // Build the five per-unit stage dots for this row
+      const dots = UNITS.map((unit, i) => {
+        const unitState = req.units[i];
+        const dotClass  = unitState.status === 'approved'  ? 'dot-done'   :
+                          unitState.status === 'current'   ? 'dot-active' :
+                          unitState.status === 'rejected'  ? 'dot-reject' : 'dot-wait';
+        const dotIcon   = unitState.status === 'approved'  ? '✓' :
+                          unitState.status === 'current'   ? '●' :
+                          unitState.status === 'rejected'  ? '✗' : i + 1;
+        return '<div class="stage-dot ' + dotClass + '">' + dotIcon + '</div>';
+      });
+
+      // Map request status to badge CSS class and display text
+      const badgeClass = { active: 'badge-active', cleared: 'badge-cleared', 'needs-action': 'badge-needs' }[req.status] || 'badge-pending';
+      const badgeText  = { active: 'In Progress',  cleared: 'Cleared',       'needs-action': 'Action Needed' }[req.status] || req.status;
+
+      return '<div class="board-row" onclick="openDetail(\'' + req.id + '\')">'
+           + '<div><div class="board-name">' + req.name + '</div><div class="board-dept">' + req.staffId + '</div></div>'
+           + '<div style="font-size:12px;color:var(--dim)">' + req.dept + '</div>'
+           + dots.join('')
+           + '<span class="badge ' + badgeClass + '">' + badgeText + '</span>'
+           + '</div>';
+    }).join('');
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+   * CLEARANCE REQUEST DETAIL VIEW
+   * Renders the full detail page for a single clearance request.
+   * The content is role-sensitive — what appears in the action
+   * panel depends on the currently active role:
+   *
+   *   Unit officer (matching currentUnit) → Approve / Reject buttons
+   *   Staff member with 'needs-action'    → Resubmit button
+   *   Other roles                         → Read-only pending message
+   *   Cleared request                     → Certificate buttons
+   * ───────────────────────────────────────────────────────────── */
+
+  /**
+   * Sets the active request and navigates to the detail view.
+   * Remembers whether we came from the dashboard or the portal
+   * so the back button returns to the correct parent.
+   * @param {string} id - The clearance request ID to open
+   */
+  function openDetail(id) {
+    activeReqId = id;
+
+    // Determine the correct back destination by inspecting the active nav tab
+    const activeTabText = document.querySelector('.nav-tab.active')?.textContent.trim().toLowerCase() || '';
+    prevView = activeTabText.includes('portal') ? 'portal' : 'dashboard';
+
+    renderDetail(id);
+    showView('detail', true); // skipHistory=true so prevView is not overwritten
+  }
 
 function renderDetail(id) {
   const req=requests.find(r=>r.id===id);if(!req)return;
@@ -1033,143 +1593,289 @@ function renderDetail(id) {
     </div>`;
 }
 
-// ══════════════════════════════════════════════════════════════
-// DOCUMENT REPOSITORY RENDER
-// ══════════════════════════════════════════════════════════════
-function renderDocRepo(req, activeTab) {
-  const tab = activeTab || 'all';
-  const all = req.documents || [];
-  const submitted = all.filter(d=>d.category==='submitted');
-  const generated = all.filter(d=>d.category==='generated');
-  const finalDocs = all.filter(d=>d.category==='final');
+  /* ─────────────────────────────────────────────────────────────
+   * DOCUMENT REPOSITORY
+   * Central panel showing all documents attached to a clearance
+   * request. Contains three categories:
+   *
+   *   submitted  — Files uploaded by the staff member at submission
+   *                (resignation letter, handover doc, ID, etc.)
+   *   generated  — Unit clearance slips auto-created on each approval
+   *   final      — The exit clearance certificate created when HR approves
+   *
+   * All categories are visible to all units, so each team can
+   * review prior slips and staff submissions before deciding.
+   * Clicking any document card opens the document viewer modal.
+   * ───────────────────────────────────────────────────────────── */
 
-  const filtered = tab==='submitted'?submitted:tab==='generated'?generated:tab==='final'?finalDocs:all;
+  /**
+   * Builds and returns the HTML for the Document Repository panel.
+   * Renders tabbed navigation and a card grid for the active tab's
+   * documents. The panel is re-rendered (via outerHTML swap) when
+   * the user switches tabs, preserving the scroll position.
+   *
+   * @param {object} req       - The clearance request object
+   * @param {string} activeTab - Active tab key: 'all' | 'submitted' | 'generated' | 'final'
+   * @returns {string} HTML string for the document repository panel
+   */
+  function renderDocRepo(req, activeTab) {
+    const tab       = activeTab || 'all';
+    const all       = req.documents || [];
+    const submitted = all.filter(d => d.category === 'submitted');
+    const generated = all.filter(d => d.category === 'generated');
+    const finalDocs = all.filter(d => d.category === 'final');
 
-  const docCards = filtered.length ? filtered.map(d=>{
-    const icon = d.category==='submitted'?fileIcon(d.name):d.category==='final'?'🏛️':'📋';
-    const badgeCls = d.category==='submitted'?'badge-submitted':d.category==='final'?'badge-final':'badge-generated';
-    const badgeTxt = d.category==='submitted'?'Uploaded':d.category==='final'?'Certificate':'Unit Slip';
-    return `<div class="doc-card" onclick="openDocViewer('${req.id}','${d.id}')">
-      <span class="doc-card-badge ${badgeCls}">${badgeTxt}</span>
-      <div class="doc-card-icon">${icon}</div>
-      <div class="doc-card-name">${d.name}</div>
-      <div class="doc-card-meta">${d.uploadedBy}<br>${d.uploadedAt}</div>
+    // Filter the visible documents based on the selected tab
+    const filtered = tab === 'submitted' ? submitted :
+                     tab === 'generated' ? generated :
+                     tab === 'final'     ? finalDocs : all;
+
+    // Build document cards or show an empty state
+    const docCards = filtered.length
+      ? filtered.map(doc => {
+          const icon     = doc.category === 'submitted' ? fileIcon(doc.name) : doc.category === 'final' ? '🏛️' : '📋';
+          const badgeCls = doc.category === 'submitted' ? 'badge-submitted'  : doc.category === 'final' ? 'badge-final' : 'badge-generated';
+          const badgeTxt = doc.category === 'submitted' ? 'Uploaded'         : doc.category === 'final' ? 'Certificate' : 'Unit Slip';
+          return `<div class="doc-card" onclick="openDocViewer('${req.id}','${doc.id}')">
+            <span class="doc-card-badge ${badgeCls}">${badgeTxt}</span>
+            <div class="doc-card-icon">${icon}</div>
+            <div class="doc-card-name">${doc.name}</div>
+            <div class="doc-card-meta">${doc.uploadedBy}<br>${doc.uploadedAt}</div>
+          </div>`;
+        }).join('')
+      : '<div class="doc-empty">No documents in this category yet.</div>';
+
+    return `<div class="doc-repo" id="docRepo">
+      <div class="section-title" style="margin-bottom:.75rem">Document Repository</div>
+      <p style="font-size:12px;color:var(--dim);margin-bottom:1rem">All submitted and auto-generated documents. Visible to all clearance units.</p>
+      <div class="doc-tabs">
+        <button class="doc-tab ${tab === 'all'       ? 'active' : ''}" onclick="switchDocTab('${req.id}','all')">All (${all.length})</button>
+        <button class="doc-tab ${tab === 'submitted' ? 'active' : ''}" onclick="switchDocTab('${req.id}','submitted')">Submitted by Staff (${submitted.length})</button>
+        <button class="doc-tab ${tab === 'generated' ? 'active' : ''}" onclick="switchDocTab('${req.id}','generated')">Unit Clearance Slips (${generated.length})</button>
+        <button class="doc-tab ${tab === 'final'     ? 'active' : ''}" onclick="switchDocTab('${req.id}','final')">Final Certificate (${finalDocs.length})</button>
+      </div>
+      <div class="doc-grid">${docCards}</div>
     </div>`;
-  }).join('') : '<div class="doc-empty">No documents in this category yet.</div>';
-
-  return `<div class="doc-repo" id="docRepo">
-    <div class="section-title" style="margin-bottom:.75rem">Document Repository</div>
-    <p style="font-size:12px;color:var(--dim);margin-bottom:1rem">All submitted and auto-generated documents. Visible to all clearance units.</p>
-    <div class="doc-tabs">
-      <button class="doc-tab ${tab==='all'?'active':''}" onclick="switchDocTab('${req.id}','all')">All (${all.length})</button>
-      <button class="doc-tab ${tab==='submitted'?'active':''}" onclick="switchDocTab('${req.id}','submitted')">Submitted by Staff (${submitted.length})</button>
-      <button class="doc-tab ${tab==='generated'?'active':''}" onclick="switchDocTab('${req.id}','generated')">Unit Clearance Slips (${generated.length})</button>
-      <button class="doc-tab ${tab==='final'?'active':''}" onclick="switchDocTab('${req.id}','final')">Final Certificate (${finalDocs.length})</button>
-    </div>
-    <div class="doc-grid">${docCards}</div>
-  </div>`;
-}
-
-function switchDocTab(reqId, tab) {
-  const req=requests.find(r=>r.id===reqId);if(!req)return;
-  const repoEl=document.getElementById('docRepo');if(!repoEl)return;
-  repoEl.outerHTML=renderDocRepo(req,tab);
-}
-
-function scrollToDocRepo() {
-  const el=document.getElementById('docRepo');if(el)el.scrollIntoView({behavior:'smooth'});
-}
-
-// ══════════════════════════════════════════════════════════════
-// DOCUMENT VIEWER
-// ══════════════════════════════════════════════════════════════
-function openDocViewer(reqId, docId) {
-  const req=requests.find(r=>r.id===reqId);if(!req)return;
-  const doc=req.documents.find(d=>d.id===docId);if(!doc)return;
-
-  document.getElementById('docViewerTitle').textContent=doc.name;
-
-  let bodyHtml='';
-  if (doc.html) {
-    // Generated HTML document (unit slip or certificate)
-    bodyHtml=doc.html;
-  } else if (doc.dataURL) {
-    const ext=doc.ext||'';
-    if (['jpg','jpeg','png','gif','webp'].includes(ext)) {
-      bodyHtml=`<img class="doc-preview-img" src="${doc.dataURL}" alt="${doc.name}">`;
-    } else if (ext==='pdf') {
-      bodyHtml=`<embed class="doc-preview-pdf" src="${doc.dataURL}" type="application/pdf">`;
-    } else {
-      bodyHtml=`<div class="doc-preview-placeholder">
-        <div class="doc-placeholder-icon">${fileIcon(doc.name)}</div>
-        <div class="doc-placeholder-name">${doc.name}</div>
-        <div class="doc-placeholder-meta">${fileSize(doc.size||0)} · Uploaded by ${doc.uploadedBy}<br>${doc.uploadedAt}</div>
-        <p style="font-size:12px;color:var(--dim);margin-top:1rem">Preview not available for this file type. In a live SharePoint environment, this document would open in its native application.</p>
-        <a href="${doc.dataURL}" download="${doc.name}" style="display:inline-block;margin-top:1rem;padding:10px 20px;background:rgba(28,171,226,.15);color:var(--blue);border-radius:8px;text-decoration:none;font-size:13px;font-weight:700;">⬇ Download File</a>
-      </div>`;
-    }
-  } else {
-    bodyHtml=`<div class="doc-preview-placeholder"><div class="doc-placeholder-icon">📄</div><div class="doc-placeholder-name">${doc.name}</div><div class="doc-placeholder-meta">${doc.uploadedBy} · ${doc.uploadedAt}</div></div>`;
   }
 
-  document.getElementById('docViewerBody').innerHTML=bodyHtml;
-  document.getElementById('docViewerModal').classList.remove('hidden');
-}
-function closeDocViewer(){document.getElementById('docViewerModal').classList.add('hidden');}
+  /**
+   * Switches the active tab in the document repository panel
+   * by replacing the panel's outer HTML with a freshly rendered version.
+   * @param {string} reqId - The clearance request ID
+   * @param {string} tab   - Tab to switch to: 'all' | 'submitted' | 'generated' | 'final'
+   */
+  function switchDocTab(reqId, tab) {
+    const req    = requests.find(r => r.id === reqId);
+    if (!req) return;
+    const repoEl = document.getElementById('docRepo');
+    if (!repoEl) return;
+    repoEl.outerHTML = renderDocRepo(req, tab);
+  }
 
-// ══════════════════════════════════════════════════════════════
-// UNIT PORTAL
-// ══════════════════════════════════════════════════════════════
-function renderPortal() {
-  const roleInfo=ROLE_MAP[currentRole];
-  const unitIdx=roleInfo.unitIdx;
+  /**
+   * Smoothly scrolls the detail view down to the document repository
+   * panel — used by the "View Document Repository" button on the
+   * cleared banner.
+   */
+  function scrollToDocRepo() {
+    const el = document.getElementById('docRepo');
+    if (el) el.scrollIntoView({ behavior: 'smooth' });
+  }
 
-  if (unitIdx===null){
-    document.getElementById('portalIcon').textContent=roleInfo.icon;
-    document.getElementById('portalUnitName').textContent=roleInfo.label+' — All Queues';
-    document.getElementById('portalRoleName').textContent='Overview of all pending unit actions';
-    const pending=requests.filter(r=>r.status==='active');
-    if (!pending.length){document.getElementById('portalQueue').innerHTML='<div class="empty-queue"><div class="empty-queue-icon">✅</div>No pending items across any unit.</div>';return;}
-    document.getElementById('portalQueue').innerHTML=pending.map(r=>{
-      const cu=UNITS[r.currentUnit];
-      return `<div class="portal-queue-item" onclick="openDetail('${r.id}')">
-        <div class="pqi-top"><div class="pqi-name">${r.name}</div><span class="badge badge-active">Step ${r.currentUnit+1}/5</span></div>
-        <div class="pqi-meta">🏢 ${r.dept} · 📋 ${r.reason} · Submitted ${r.submitted}</div>
-        <div class="pqi-meta" style="margin-top:4px">⚡ Awaiting: <strong>${cu.name}</strong></div>
-        <div class="pqi-meta" style="margin-top:4px">📎 ${r.documents.length} document(s) in repository</div>
+  /* ─────────────────────────────────────────────────────────────
+   * DOCUMENT VIEWER MODAL
+   * Opens a modal to preview any document from the repository.
+   *
+   * Rendering strategy by document type:
+   *   html (generated slips / certificate) → render HTML directly
+   *   image (jpg/png/gif/webp)             → <img> element
+   *   pdf                                  → <embed> element
+   *   all other file types                 → placeholder with download link
+   *
+   * In a live SharePoint environment, Word/Excel/PDF files would
+   * open natively in the browser via the Microsoft Office Online
+   * viewer — no download required.
+   * ───────────────────────────────────────────────────────────── */
+
+  /**
+   * Opens the document viewer modal for a specific document.
+   * @param {string} reqId - The clearance request ID
+   * @param {string} docId - The document ID within req.documents
+   */
+  function openDocViewer(reqId, docId) {
+    const req = requests.find(r => r.id === reqId);
+    if (!req) return;
+    const doc = req.documents.find(d => d.id === docId);
+    if (!doc) return;
+
+    document.getElementById('docViewerTitle').textContent = doc.name;
+
+    let bodyHtml = '';
+
+    if (doc.html) {
+      // Auto-generated documents (unit slips and final certificate)
+      // are stored as HTML strings and rendered directly
+      bodyHtml = doc.html;
+
+    } else if (doc.dataURL) {
+      const ext = doc.ext || '';
+
+      if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) {
+        // Inline image preview
+        bodyHtml = `<img class="doc-preview-img" src="${doc.dataURL}" alt="${doc.name}">`;
+
+      } else if (ext === 'pdf') {
+        // Embed PDF using the browser's built-in PDF viewer
+        bodyHtml = `<embed class="doc-preview-pdf" src="${doc.dataURL}" type="application/pdf">`;
+
+      } else {
+        // For Word, email, and other file types: show metadata and a download link.
+        // In production these would open in Office Online viewer within SharePoint.
+        bodyHtml = `
+          <div class="doc-preview-placeholder">
+            <div class="doc-placeholder-icon">${fileIcon(doc.name)}</div>
+            <div class="doc-placeholder-name">${doc.name}</div>
+            <div class="doc-placeholder-meta">
+              ${fileSize(doc.size || 0)} · Uploaded by ${doc.uploadedBy}<br>${doc.uploadedAt}
+            </div>
+            <p style="font-size:12px;color:var(--dim);margin-top:1rem">
+              Preview not available for this file type. In a live SharePoint environment,
+              this document would open in its native Office Online application.
+            </p>
+            <a href="${doc.dataURL}" download="${doc.name}"
+               style="display:inline-block;margin-top:1rem;padding:10px 20px;
+                      background:rgba(28,171,226,.15);color:var(--blue);border-radius:8px;
+                      text-decoration:none;font-size:13px;font-weight:700;">
+              ⬇ Download File
+            </a>
+          </div>`;
+      }
+
+    } else {
+      // Demo documents (pre-seeded without real file data) show a metadata placeholder
+      bodyHtml = `
+        <div class="doc-preview-placeholder">
+          <div class="doc-placeholder-icon">📄</div>
+          <div class="doc-placeholder-name">${doc.name}</div>
+          <div class="doc-placeholder-meta">${doc.uploadedBy} · ${doc.uploadedAt}</div>
+        </div>`;
+    }
+
+    document.getElementById('docViewerBody').innerHTML = bodyHtml;
+    document.getElementById('docViewerModal').classList.remove('hidden');
+  }
+
+  /** Closes the document viewer modal. */
+  function closeDocViewer() {
+    document.getElementById('docViewerModal').classList.add('hidden');
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+   * UNIT PORTAL (INBOX VIEW)
+   * Simulates the role-filtered inbox each unit officer would see
+   * in the real SharePoint system. Only requests currently awaiting
+   * that specific unit's action appear in the queue.
+   *
+   * In production, Power Automate sends an approval email with
+   * embedded Approve/Reject buttons directly into the officer's
+   * Outlook inbox. This portal view represents the SharePoint
+   * list page filtered to "My Queue".
+   *
+   * Roles with unitIdx: null (HR Manager, Staff Member) see a
+   * cross-unit overview of all in-progress requests instead.
+   * ───────────────────────────────────────────────────────────── */
+
+  /**
+   * Renders the Unit Portal view based on the current active role.
+   * Shows a filtered queue for unit officers, or a full overview
+   * for management and staff roles.
+   */
+  function renderPortal() {
+    const roleInfo = ROLE_MAP[currentRole];
+    const unitIdx  = roleInfo.unitIdx;
+
+    // Roles without a unit index (HR Manager, Staff) see all active requests
+    if (unitIdx === null) {
+      document.getElementById('portalIcon').textContent     = roleInfo.icon;
+      document.getElementById('portalUnitName').textContent = roleInfo.label + ' — All Queues';
+      document.getElementById('portalRoleName').textContent = 'Overview of all pending unit actions';
+
+      const pending = requests.filter(r => r.status === 'active');
+
+      if (!pending.length) {
+        document.getElementById('portalQueue').innerHTML =
+          '<div class="empty-queue"><div class="empty-queue-icon">✅</div>No pending items across any unit.</div>';
+        return;
+      }
+
+      document.getElementById('portalQueue').innerHTML = pending.map(req => {
+        const currentUnit = UNITS[req.currentUnit];
+        return `<div class="portal-queue-item" onclick="openDetail('${req.id}')">
+          <div class="pqi-top">
+            <div class="pqi-name">${req.name}</div>
+            <span class="badge badge-active">Step ${req.currentUnit + 1}/5</span>
+          </div>
+          <div class="pqi-meta">🏢 ${req.dept} · 📋 ${req.reason} · Submitted ${req.submitted}</div>
+          <div class="pqi-meta" style="margin-top:4px">⚡ Awaiting: <strong>${currentUnit.name}</strong></div>
+          <div class="pqi-meta" style="margin-top:4px">📎 ${req.documents.length} document(s) in repository</div>
+        </div>`;
+      }).join('');
+      return;
+    }
+
+    // Unit officer view — show only requests pending at this officer's unit
+    const unit = UNITS[unitIdx];
+    document.getElementById('portalIcon').textContent     = unit.icon;
+    document.getElementById('portalUnitName').textContent = unit.name + ' Unit';
+    document.getElementById('portalRoleName').textContent = unit.role + ' — Inbox View';
+
+    const myQueue = requests.filter(r => r.status === 'active' && r.currentUnit === unitIdx);
+
+    if (!myQueue.length) {
+      document.getElementById('portalQueue').innerHTML =
+        '<div class="empty-queue"><div class="empty-queue-icon">📭</div>' +
+        'No pending items in your queue.<br>You will receive an email notification when a request reaches your unit.</div>';
+      return;
+    }
+
+    document.getElementById('portalQueue').innerHTML = myQueue.map(req => {
+      const elapsed   = Date.now() - req.slaStart;
+      const slaMs     = SLA_MINUTES * 60 * 1000;
+      const remaining = Math.max(slaMs - elapsed, 0);
+      const isOverdue = elapsed > slaMs;
+
+      // Count attached staff documents and previously generated unit slips
+      const staffDocCount = req.documents.filter(d => d.category === 'submitted').length;
+      const slipCount     = req.documents.filter(d => d.category === 'generated').length;
+
+      return `<div class="portal-queue-item" onclick="openDetail('${req.id}')">
+        <div class="pqi-top">
+          <div class="pqi-name">${req.name}</div>
+          <span class="badge badge-active">Awaiting Your Action</span>
+        </div>
+        <div class="pqi-meta">🪪 ${req.staffId} · 🏢 ${req.dept} · Exit: ${req.date}</div>
+        <div class="pqi-meta" style="margin-top:4px">Reason: ${req.reason}</div>
+        <div class="pqi-meta" style="margin-top:4px">
+          📎 ${staffDocCount} staff document(s) · 📋 ${slipCount} prior clearance slip(s)
+        </div>
+        <div class="pqi-sla ${isOverdue ? 'over' : ''}">
+          ${isOverdue ? '⚠️ SLA Breached' : '⏱ SLA: ' + Math.ceil(remaining / 1000) + 's remaining'}
+        </div>
       </div>`;
     }).join('');
-    return;
   }
 
-  const unit=UNITS[unitIdx];
-  document.getElementById('portalIcon').textContent=unit.icon;
-  document.getElementById('portalUnitName').textContent=unit.name+' Unit';
-  document.getElementById('portalRoleName').textContent=unit.role+' — Inbox View';
-
-  const myQueue=requests.filter(r=>r.status==='active'&&r.currentUnit===unitIdx);
-  if (!myQueue.length){
-    document.getElementById('portalQueue').innerHTML='<div class="empty-queue"><div class="empty-queue-icon">📭</div>No pending items in your queue.<br>You will receive an email notification when a request reaches your unit.</div>';
-    return;
-  }
-  document.getElementById('portalQueue').innerHTML=myQueue.map(r=>{
-    const ms=Date.now()-r.slaStart,slaMs=SLA_MINUTES*60000;
-    const rem=Math.max(slaMs-ms,0),over=ms>slaMs;
-    const docCount=r.documents.filter(d=>d.category==='submitted').length;
-    const slipCount=r.documents.filter(d=>d.category==='generated').length;
-    return `<div class="portal-queue-item" onclick="openDetail('${r.id}')">
-      <div class="pqi-top"><div class="pqi-name">${r.name}</div><span class="badge badge-active">Awaiting Your Action</span></div>
-      <div class="pqi-meta">🪪 ${r.staffId} · 🏢 ${r.dept} · Exit: ${r.date}</div>
-      <div class="pqi-meta" style="margin-top:4px">Reason: ${r.reason}</div>
-      <div class="pqi-meta" style="margin-top:4px">📎 ${docCount} staff document(s) · 📋 ${slipCount} prior clearance slip(s)</div>
-      <div class="pqi-sla ${over?'over':''}">${over?'⚠️ SLA Breached':'⏱ SLA: '+Math.ceil(rem/1000)+'s remaining'}</div>
-    </div>`;
-  }).join('');
-}
-
-// ══════════════════════════════════════════════════════════════
-// FINAL CERTIFICATE
-// ══════════════════════════════════════════════════════════════
+  /* ─────────────────────────────────────────────────────────────
+   * FINAL EXIT CLEARANCE CERTIFICATE
+   * Auto-generated when the HR unit (the 5th and final unit)
+   * approves a request. The certificate is stored as an HTML
+   * document in the repository and is also viewable via the
+   * dedicated modal launched from the cleared banner.
+   *
+   * In the real system, Power Automate would use a Word template
+   * to produce a digitally signed PDF, stored in SharePoint and
+   * emailed to the staff member and HR records.
+   * ───────────────────────────────────────────────────────────── */
 function buildFinalCertHTML(req) {
   return `<div style="background:#fff;color:#111;padding:2rem;border-radius:12px;font-family:'Segoe UI',sans-serif">
     <div style="text-align:center;border-bottom:2px solid #1CABE2;padding-bottom:1rem;margin-bottom:1.5rem">
@@ -1216,24 +1922,53 @@ function showCertificate(id) {
 function closeCertModal(){document.getElementById('certModal').classList.add('hidden');}
 function downloadCert(){toast('Certificate downloaded (simulated in prototype)','success');closeCertModal();}
 
-// ══════════════════════════════════════════════════════════════
-// TOAST
-// ══════════════════════════════════════════════════════════════
-function toast(msg,type='info'){
-  const icons={success:'✅',error:'❌',info:'ℹ️',warn:'⚠️'};
-  const wrap=document.getElementById('toastContainer');
-  const t=document.createElement('div');
-  t.className='toast '+type;
-  t.innerHTML='<span>'+(icons[type]||'ℹ️')+'</span><span>'+msg+'</span>';
-  wrap.appendChild(t);
-  setTimeout(()=>{t.style.animation='slideIn .3s reverse';setTimeout(()=>t.remove(),300);},4000);
-}
+  /* ─────────────────────────────────────────────────────────────
+   * TOAST NOTIFICATIONS
+   * Lightweight slide-in notification system that replaces the
+   * email / Teams notifications a real Power Automate flow would
+   * send to participants. Each toast auto-dismisses after 4 seconds.
+   * ───────────────────────────────────────────────────────────── */
 
-// ══════════════════════════════════════════════════════════════
-// INIT — seed 2 demo requests with documents
-// ══════════════════════════════════════════════════════════════
-window.onload = () => {
-  document.getElementById('fDate').min = new Date().toISOString().split('T')[0];
+  /**
+   * Displays a slide-in toast notification at the top-right of the screen.
+   * @param {string} msg  - The message to display
+   * @param {string} type - Notification type: 'success' | 'error' | 'info' | 'warn'
+   */
+  function toast(msg, type = 'info') {
+    const icons = { success: '✅', error: '❌', info: 'ℹ️', warn: '⚠️' };
+    const wrap  = document.getElementById('toastContainer');
+
+    const el = document.createElement('div');
+    el.className = 'toast ' + type;
+    el.innerHTML = '<span>' + (icons[type] || 'ℹ️') + '</span><span>' + msg + '</span>';
+    wrap.appendChild(el);
+
+    // Slide out and remove after 4 seconds
+    setTimeout(() => {
+      el.style.animation = 'slideIn .3s reverse';
+      setTimeout(() => el.remove(), 300);
+    }, 4000);
+  }
+
+  /* ─────────────────────────────────────────────────────────────
+   * INITIALISATION — DEMO DATA SEEDING
+   * On page load, two realistic clearance requests are pre-seeded
+   * so reviewers can explore the system immediately without
+   * needing to submit their own requests first.
+   *
+   *   Demo 1 (Amara Osei-Bonsu) — In progress at ICT (Step 3/5)
+   *     Admin and Security have already approved. ICT is the
+   *     active unit. Includes 2 staff documents and 2 generated
+   *     clearance slips.
+   *
+   *   Demo 2 (Ngozi Adeyemi) — Returned by Finance (Needs Action)
+   *     Three units approved, Finance returned it due to an
+   *     outstanding loan. Includes 1 staff document and 3 slips.
+   * ───────────────────────────────────────────────────────────── */
+
+  window.onload = () => {
+    // Prevent the date picker from allowing exit dates in the past
+    document.getElementById('fDate').min = new Date().toISOString().split('T')[0];
 
   const d1 = {
     id:'CLR-DEMO01', name:'Amara Osei-Bonsu', staffId:'UN-2024-0047',
